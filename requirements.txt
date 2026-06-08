@@ -1,0 +1,7 @@
+streamlit
+agno
+openai
+lancedb
+pypdf
+python-dotenv
+httpx
