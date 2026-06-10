@@ -5,3 +5,5 @@ lancedb
 pypdf
 python-dotenv
 httpx
+requests
+beautifulsoup4

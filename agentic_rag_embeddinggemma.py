@@ -90,11 +90,16 @@ with st.sidebar:
         else:
             st.error("Please enter a URL")
 
-    # Display current URLs
-    if st.session_state.urls:
-        st.subheader("📚 Current Knowledge Sources")
-        for i, url in enumerate(st.session_state.urls, 1):
-            st.markdown(f"{i}. {url}")
+ 
+    uploaded_file = st.file_uploader("Upload PDF", type="pdf")
+    if uploaded_file is not None:
+        with open(uploaded_file.name, "wb") as _f:
+            _f.write(uploaded_file.getbuffer())
+        kb.add_content(path=uploaded_file.name, reader=PDFReader())
+        st.success("Added: " + uploaded_file.name)
+    st.subheader("📚 Current Knowledge Sources")
+    for i, url in enumerate(st.session_state.urls, 1):
+        st.markdown(f"{i}. {url}")
 
 # Main title and description
 st.title("🔥 Agentic RAG with EmbeddingGemma (100% local)")
