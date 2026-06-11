@@ -1,12 +1,9 @@
 """
-Agentic RAG c EmbeddingGemma (100% локально) - ВЕРСИЯ 3
-Исправлено:
-- Убран upsert (вызывал ошибку DataFusion "Array length 0")
-- Проверка эмбеддера при старте (понятное сообщение вместо краша)
-- Фильтрация пустых чанков
-- Видно длину вектора и статус индексации
+Agentic RAG - облачная версия (aitunnel)
+Эмбеддинги: text-embedding-3-small | Генерация: Gemini | Без Ollama
 """
 
+import os
 import hashlib
 import tempfile
 from pathlib import Path
@@ -14,48 +11,50 @@ from pathlib import Path
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 
 from agno.agent import Agent
-from agno.models.ollama import Ollama
-from agno.embedder.ollama import OllamaEmbedder
+from agno.models.openai import OpenAIChat
+from agno.embedder.openai import OpenAIEmbedder
 from agno.vectordb.lancedb import LanceDb, SearchType
 from agno.knowledge.agent import AgentKnowledge
 from agno.document.base import Document
 from agno.document.reader.pdf_reader import PDFReader
 from agno.document.chunking.fixed import FixedSizeChunking
 
+load_dotenv()
+
 # ========================= НАСТРОЙКИ =========================
 DB_DIR = "data/lancedb"
 TABLE_NAME = "documents"
-EMBED_MODEL = "embeddinggemma"
-LLM_MODEL = "llama3.2"
+LLM_MODEL = "gemini-3.1-flash-lite"
+EMBED_MODEL = "text-embedding-3-small"
+EMBED_DIM = 1536
+API_KEY = os.getenv("AITUNNEL_API_KEY")
+BASE_URL = "https://api.aitunnel.ru/v1"
 NUM_DOCUMENTS = 10
-
-# Если снова будет ошибка LanceDB - поменяйте hybrid на vector:
 SEARCH_TYPE = SearchType.vector
 
 CHUNKER = FixedSizeChunking(chunk_size=800, overlap=150)
 
 
-# ================== ЭМБЕДДЕР С ПРЕФИКСАМИ GEMMA ==================
-class GemmaEmbedder(OllamaEmbedder):
-    def get_embedding(self, text: str):
-        if not text.startswith(("task:", "title:")):
-            text = f"title: none | text: {text}"
-        return super().get_embedding(text)
-
-
 # ================== КЭШИРОВАННЫЕ РЕСУРСЫ ==================
 @st.cache_resource
-def get_embedder() -> GemmaEmbedder:
-    return GemmaEmbedder(id=EMBED_MODEL, dimensions=768)
+def get_embedder():
+    return OpenAIEmbedder(
+        id=EMBED_MODEL,
+        dimensions=EMBED_DIM,
+        api_key=API_KEY,
+        base_url=BASE_URL,
+    )
 
 
 @st.cache_resource
 def get_knowledge_base() -> AgentKnowledge:
     vector_db = LanceDb(
         table_name=TABLE_NAME,
-        uri=DB_DIR, use_tantivy=False, 
+        uri=DB_DIR,
+        use_tantivy=False,
         search_type=SEARCH_TYPE,
         embedder=get_embedder(),
     )
@@ -65,11 +64,10 @@ def get_knowledge_base() -> AgentKnowledge:
 @st.cache_resource
 def get_agent() -> Agent:
     return Agent(
-        model=Ollama(id=LLM_MODEL, options={"temperature": 0.1}),
+        model=OpenAIChat(id=LLM_MODEL, api_key=API_KEY, base_url=BASE_URL),
         knowledge=get_knowledge_base(),
         search_knowledge=True,
         instructions=[
-            "ВСЕГДА сначала ищи информацию в базе знаний.",
             "Отвечай ТОЛЬКО на основе найденных документов.",
             "Если информации нет в документах - честно скажи об этом.",
             "Указывай, из какого документа взята информация.",
@@ -80,11 +78,11 @@ def get_agent() -> Agent:
 
 
 def check_embedder() -> int:
-    """Проверяет, что эмбеддер возвращает нормальный вектор. Возвращает его длину."""
     try:
         v = get_embedder().get_embedding("проверка работы эмбеддера")
         return len(v) if v else 0
-    except Exception:
+    except Exception as e:
+        st.session_state["embed_error"] = str(e)
         return 0
 
 
@@ -99,7 +97,6 @@ def html_to_text(raw_html: str) -> str:
 def chunk_text(name: str, text: str) -> list:
     doc = Document(name=name, content=text)
     chunks = CHUNKER.chunk(doc)
-    # отбрасываем пустые/мусорные чанки - они ломают индексацию
     return [c for c in chunks if c.content and len(c.content.strip()) > 30]
 
 
@@ -129,7 +126,6 @@ def process_file(filename: str, data: bytes) -> list:
 
 
 def ingest(docs: list, source_name: str) -> bool:
-    """Загружает чанки в базу. Без upsert - обычная вставка (надёжнее на Windows)."""
     if not docs:
         st.sidebar.warning(f"Не удалось извлечь текст: {source_name}")
         return False
@@ -137,7 +133,7 @@ def ingest(docs: list, source_name: str) -> bool:
     try:
         kb.load_documents(documents=docs, skip_existing=True)
         st.session_state.sources.append(f"{source_name} ({len(docs)} чанков)")
-        st.sidebar.success(f"✅ {source_name}: {len(docs)} чанков")
+        st.sidebar.success(f"{source_name}: {len(docs)} чанков")
         return True
     except Exception as e:
         st.sidebar.error(f"Ошибка {source_name}: {e}")
@@ -149,38 +145,36 @@ def file_fingerprint(name: str, data: bytes) -> str:
 
 
 # ================== ИНТЕРФЕЙС ==================
-st.set_page_config(page_title="Agentic RAG with EmbeddingGemma", page_icon="🔥")
+st.set_page_config(page_title="Agentic RAG", page_icon="🔥")
 
 if "loaded_files" not in st.session_state:
     st.session_state.loaded_files = set()
 if "sources" not in st.session_state:
     st.session_state.sources = []
 
-st.title("🔥 Agentic RAG с EmbeddingGemma (100% локально)")
+st.title("🔥 Agentic RAG - чат с документами")
 
-# --- Проверка эмбеддера при старте ---
 dim = check_embedder()
 if dim == 0:
     st.error(
-        "❌ Эмбеддер не работает: модель embeddinggemma возвращает пустой вектор.\n\n"
-        "Выполните в PowerShell:\n"
-        "```\nollama rm embeddinggemma\nollama pull embeddinggemma\n```\n"
-        "Затем перезапустите приложение."
+        "Эмбеддер не работает. Проверьте ключ AITUNNEL_API_KEY в файле .env "
+        "и баланс на aitunnel.\n\n"
+        f"Детали: {st.session_state.get('embed_error', 'нет данных')}"
     )
     st.stop()
 else:
-    st.caption(f"✅ Эмбеддер работает, размерность вектора: {dim}")
+    st.caption(f"Эмбеддер работает (облако), размерность вектора: {dim}")
 
 st.markdown(
-    "Локальная RAG-система: **EmbeddingGemma** + **LanceDB** + **Ollama**.\n\n"
+    "Облачная RAG-система: **OpenAI Embeddings** + **LanceDB** + **Gemini**.\n\n"
     "Добавьте PDF / HTML / TXT в боковую панель и задавайте вопросы."
 )
 
 # ---------- Боковая панель ----------
-st.sidebar.header("🌐 Добавление источников знаний")
+st.sidebar.header("Добавление источников знаний")
 
 url = st.sidebar.text_input("Добавить URL-адрес", placeholder="https://example.com/sample.pdf")
-if st.sidebar.button("➕ Добавить URL"):
+if st.sidebar.button("Добавить URL"):
     if url and url not in st.session_state.loaded_files:
         try:
             with st.spinner("Скачиваю и индексирую..."):
@@ -217,14 +211,14 @@ if uploaded:
             except Exception as e:
                 st.sidebar.error(f"Ошибка {f.name}: {e}")
 
-st.sidebar.header("📚 Текущие источники знаний")
+st.sidebar.header("Текущие источники знаний")
 if st.session_state.sources:
     for s in st.session_state.sources:
         st.sidebar.markdown(f"- {s}")
 else:
     st.sidebar.caption("Источники пока не добавлены.")
 
-if st.sidebar.button("🗑 Очистить базу знаний"):
+if st.sidebar.button("Очистить базу знаний"):
     try:
         get_knowledge_base().vector_db.drop()
     except Exception:
@@ -237,7 +231,7 @@ if st.sidebar.button("🗑 Очистить базу знаний"):
 # ---------- Вопрос и ответ ----------
 question = st.text_input("Введите свой вопрос:", placeholder="О чём этот документ?")
 
-if st.button("🚀 Получить ответ") and question:
+if st.button("Получить ответ") and question:
     kb = get_knowledge_base()
 
     with st.spinner("Ищу в базе знаний..."):
@@ -247,24 +241,34 @@ if st.button("🚀 Получить ответ") and question:
             results = []
 
     if results:
-        with st.expander(f"🔎 Найдено фрагментов: {len(results)} (источники)"):
+        with st.expander(f"Найдено фрагментов: {len(results)} (источники)"):
             for i, doc in enumerate(results, 1):
                 st.markdown(f"**{i}. {doc.name}**")
                 st.caption(doc.content[:400] + "...")
     else:
-        st.warning("⚠️ В базе знаний ничего не найдено. Сначала загрузите документы слева.")
+        st.warning("В базе знаний ничего не найдено. Сначала загрузите документы слева.")
 
     with st.spinner("Генерирую ответ..."):
         agent = get_agent()
-        response = agent.run(question)
+        if results:
+            context = "\n\n".join(f"[Источник: {d.name}]\n{d.content}" for d in results)
+            prompt = (
+                "Ответь на вопрос, используя ТОЛЬКО текст из документов ниже. "
+                "Если ответа нет в тексте - честно скажи об этом. "
+                "Отвечай на русском языке. В конце укажи, из какого файла взята информация.\n\n"
+                "ТЕКСТ ДОКУМЕНТОВ:\n" + context + "\n\nВОПРОС: " + question
+            )
+            response = agent.run(prompt)
+        else:
+            response = agent.run(question)
 
-    st.header("💡 Ответ")
+    st.header("Ответ")
     st.markdown(response.content)
 
-with st.expander("ℹ️ Как это работает"):
+with st.expander("Как это работает"):
     st.markdown(
         "1. Файлы разбиваются на чанки по 800 символов (перекрытие 150).\n"
-        "2. EmbeddingGemma создаёт векторы с префиксами.\n"
-        "3. LanceDB ищет гибридно (вектор + текст).\n"
-        "4. Агент отвечает только по найденным фрагментам."
+        "2. OpenAI Embeddings создаёт векторы.\n"
+        "3. LanceDB ищет похожие фрагменты.\n"
+        "4. Gemini отвечает только по найденным фрагментам."
     )
