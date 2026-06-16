@@ -1,6 +1,6 @@
 """
 Agentic RAG - облачная версия (aitunnel)
-Эмбеддинги: text-embedding-3-small | Генерация: Gemini | Без Ollama
+Эмбеддинги: text-embedding-3-small | Генерация: Gemini | Цитаты со страницами
 """
 
 import os
@@ -12,6 +12,7 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from pypdf import PdfReader as PyPdfReader
 
 from agno.agent import Agent
 from agno.models.openai import OpenAIChat
@@ -19,7 +20,6 @@ from agno.embedder.openai import OpenAIEmbedder
 from agno.vectordb.lancedb import LanceDb, SearchType
 from agno.knowledge.agent import AgentKnowledge
 from agno.document.base import Document
-from agno.document.reader.pdf_reader import PDFReader
 from agno.document.chunking.fixed import FixedSizeChunking
 
 load_dotenv()
@@ -41,23 +41,14 @@ CHUNKER = FixedSizeChunking(chunk_size=800, overlap=150)
 # ================== КЭШИРОВАННЫЕ РЕСУРСЫ ==================
 @st.cache_resource
 def get_embedder():
-    return OpenAIEmbedder(
-        id=EMBED_MODEL,
-        dimensions=EMBED_DIM,
-        api_key=API_KEY,
-        base_url=BASE_URL,
-    )
+    return OpenAIEmbedder(id=EMBED_MODEL, dimensions=EMBED_DIM,
+                          api_key=API_KEY, base_url=BASE_URL)
 
 
 @st.cache_resource
 def get_knowledge_base() -> AgentKnowledge:
-    vector_db = LanceDb(
-        table_name=TABLE_NAME,
-        uri=DB_DIR,
-        use_tantivy=False,
-        search_type=SEARCH_TYPE,
-        embedder=get_embedder(),
-    )
+    vector_db = LanceDb(table_name=TABLE_NAME, uri=DB_DIR, use_tantivy=False,
+                        search_type=SEARCH_TYPE, embedder=get_embedder())
     return AgentKnowledge(vector_db=vector_db, num_documents=NUM_DOCUMENTS)
 
 
@@ -65,25 +56,25 @@ def get_knowledge_base() -> AgentKnowledge:
 def get_agent() -> Agent:
     return Agent(
         model=OpenAIChat(id=LLM_MODEL, api_key=API_KEY, base_url=BASE_URL),
-        knowledge=get_knowledge_base(),
-        search_knowledge=True,
-        instructions=[
-            "Отвечай ТОЛЬКО на основе найденных документов.",
-            "Если информации нет в документах - честно скажи об этом.",
-            "Указывай, из какого документа взята информация.",
-            "Отвечай на русском языке.",
-        ],
+        instructions=["Отвечай ТОЛЬКО по переданному контексту.",
+                      "Если ответа нет - честно скажи.", "Отвечай на русском."],
         markdown=True,
     )
 
 
 def check_embedder() -> int:
     try:
-        v = get_embedder().get_embedding("проверка работы эмбеддера")
+        v = get_embedder().get_embedding("проверка")
         return len(v) if v else 0
     except Exception as e:
         st.session_state["embed_error"] = str(e)
         return 0
+
+
+def page_of(doc) -> str:
+    md = getattr(doc, "meta_data", None) or {}
+    p = md.get("page")
+    return f", стр. {p}" if p else ""
 
 
 # ================== ОБРАБОТКА ДОКУМЕНТОВ ==================
@@ -94,23 +85,31 @@ def html_to_text(raw_html: str) -> str:
     return " ".join(soup.get_text(separator=" ").split())
 
 
-def chunk_text(name: str, text: str) -> list:
+def chunk_text(name: str, text: str, page=None) -> list:
     doc = Document(name=name, content=text)
     chunks = CHUNKER.chunk(doc)
-    return [c for c in chunks if c.content and len(c.content.strip()) > 30]
+    good = []
+    for c in chunks:
+        if c.content and len(c.content.strip()) > 30:
+            c.name = name
+            c.meta_data = {"source": name, "page": page}
+            good.append(c)
+    return good
 
 
 def read_pdf_bytes(name: str, data: bytes) -> list:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f:
         f.write(data)
         tmp_path = f.name
-    reader = PDFReader(chunk=False)
-    raw_docs = reader.read(tmp_path)
     chunks = []
-    for d in raw_docs:
-        d.name = name
-        chunks.extend(chunk_text(name, d.content))
-    Path(tmp_path).unlink(missing_ok=True)
+    try:
+        reader = PyPdfReader(tmp_path)
+        for page_num, page in enumerate(reader.pages, 1):
+            text = page.extract_text() or ""
+            if text.strip():
+                chunks.extend(chunk_text(name, text, page=page_num))
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
     return chunks
 
 
@@ -127,11 +126,10 @@ def process_file(filename: str, data: bytes) -> list:
 
 def ingest(docs: list, source_name: str) -> bool:
     if not docs:
-        st.sidebar.warning(f"Не удалось извлечь текст: {source_name}")
+        st.sidebar.warning(f"Не извлечён текст: {source_name}")
         return False
-    kb = get_knowledge_base()
     try:
-        kb.load_documents(documents=docs, skip_existing=True)
+        get_knowledge_base().load_documents(documents=docs, skip_existing=True)
         st.session_state.sources.append(f"{source_name} ({len(docs)} чанков)")
         st.sidebar.success(f"{source_name}: {len(docs)} чанков")
         return True
@@ -141,7 +139,7 @@ def ingest(docs: list, source_name: str) -> bool:
 
 
 def file_fingerprint(name: str, data: bytes) -> str:
-    return hashlib.md5(name.encode() + str(len(data)).encode()).hexdigest()
+    return hashlib.sha256(name.encode() + data).hexdigest()
 
 
 # ================== ИНТЕРФЕЙС ==================
@@ -151,52 +149,37 @@ if "loaded_files" not in st.session_state:
     st.session_state.loaded_files = set()
 if "sources" not in st.session_state:
     st.session_state.sources = []
+if "history" not in st.session_state:
+    st.session_state.history = []
 
 st.title("🔥 Agentic RAG - чат с документами")
 
 dim = check_embedder()
 if dim == 0:
-    st.error(
-        "Эмбеддер не работает. Проверьте ключ AITUNNEL_API_KEY в файле .env "
-        "и баланс на aitunnel.\n\n"
-        f"Детали: {st.session_state.get('embed_error', 'нет данных')}"
-    )
+    st.error("Эмбеддер не работает. Проверьте ключ в .env.\n\n"
+             f"Детали: {st.session_state.get('embed_error', 'нет данных')}")
     st.stop()
-else:
-    st.caption(f"Эмбеддер работает (облако), размерность вектора: {dim}")
-
-st.markdown(
-    "Облачная RAG-система: **OpenAI Embeddings** + **LanceDB** + **Gemini**.\n\n"
-    "Добавьте PDF / HTML / TXT в боковую панель и задавайте вопросы."
-)
+st.caption(f"Эмбеддер работает (облако), размерность вектора: {dim}")
 
 # ---------- Боковая панель ----------
-st.sidebar.header("Добавление источников знаний")
+st.sidebar.header("Источники знаний")
+url = st.sidebar.text_input("Добавить URL", placeholder="https://...")
+if st.sidebar.button("Добавить URL") and url and url not in st.session_state.loaded_files:
+    try:
+        with st.spinner("Скачиваю..."):
+            r = requests.get(url, timeout=60)
+            r.raise_for_status()
+            if url.lower().endswith(".pdf") or "pdf" in r.headers.get("content-type", ""):
+                docs = read_pdf_bytes(url.split("/")[-1], r.content)
+            else:
+                docs = chunk_text(url, html_to_text(r.text))
+            if ingest(docs, url):
+                st.session_state.loaded_files.add(url)
+    except Exception as e:
+        st.sidebar.error(f"Ошибка: {e}")
 
-url = st.sidebar.text_input("Добавить URL-адрес", placeholder="https://example.com/sample.pdf")
-if st.sidebar.button("Добавить URL"):
-    if url and url not in st.session_state.loaded_files:
-        try:
-            with st.spinner("Скачиваю и индексирую..."):
-                resp = requests.get(url, timeout=60)
-                resp.raise_for_status()
-                ctype = resp.headers.get("content-type", "")
-                if url.lower().endswith(".pdf") or "pdf" in ctype:
-                    docs = read_pdf_bytes(url.split("/")[-1], resp.content)
-                else:
-                    docs = chunk_text(url, html_to_text(resp.text))
-                if ingest(docs, url):
-                    st.session_state.loaded_files.add(url)
-        except Exception as e:
-            st.sidebar.error(f"Ошибка: {e}")
-    elif url:
-        st.sidebar.info("Этот URL уже добавлен.")
-
-uploaded = st.sidebar.file_uploader(
-    "Загрузить файлы (PDF / HTML / TXT)",
-    type=["pdf", "html", "htm", "txt", "md"],
-    accept_multiple_files=True,
-)
+uploaded = st.sidebar.file_uploader("Загрузить файлы",
+    type=["pdf", "html", "htm", "txt", "md"], accept_multiple_files=True)
 if uploaded:
     for f in uploaded:
         data = f.getvalue()
@@ -204,19 +187,14 @@ if uploaded:
         if fid in st.session_state.loaded_files:
             continue
         with st.spinner(f"Индексирую {f.name}..."):
-            try:
-                docs = process_file(f.name, data)
-                if ingest(docs, f.name):
-                    st.session_state.loaded_files.add(fid)
-            except Exception as e:
-                st.sidebar.error(f"Ошибка {f.name}: {e}")
+            if ingest(process_file(f.name, data), f.name):
+                st.session_state.loaded_files.add(fid)
 
-st.sidebar.header("Текущие источники знаний")
-if st.session_state.sources:
-    for s in st.session_state.sources:
-        st.sidebar.markdown(f"- {s}")
-else:
-    st.sidebar.caption("Источники пока не добавлены.")
+st.sidebar.header("Текущие источники")
+for s in st.session_state.sources:
+    st.sidebar.markdown(f"- {s}")
+if not st.session_state.sources:
+    st.sidebar.caption("Пока пусто.")
 
 if st.sidebar.button("Очистить базу знаний"):
     try:
@@ -225,16 +203,15 @@ if st.sidebar.button("Очистить базу знаний"):
         pass
     st.session_state.loaded_files = set()
     st.session_state.sources = []
+    st.session_state.history = []
     st.cache_resource.clear()
     st.rerun()
 
 # ---------- Вопрос и ответ ----------
-question = st.text_input("Введите свой вопрос:", placeholder="О чём этот документ?")
-
+question = st.text_input("Ваш вопрос:", placeholder="О чём документ?")
 if st.button("Получить ответ") and question:
     kb = get_knowledge_base()
-
-    with st.spinner("Ищу в базе знаний..."):
+    with st.spinner("Ищу..."):
         try:
             results = kb.search(query=question)
         except Exception:
@@ -243,32 +220,31 @@ if st.button("Получить ответ") and question:
     if results:
         with st.expander(f"Найдено фрагментов: {len(results)} (источники)"):
             for i, doc in enumerate(results, 1):
-                st.markdown(f"**{i}. {doc.name}**")
+                st.markdown(f"**{i}. {doc.name}{page_of(doc)}**")
                 st.caption(doc.content[:400] + "...")
     else:
-        st.warning("В базе знаний ничего не найдено. Сначала загрузите документы слева.")
+        st.warning("Ничего не найдено. Загрузите документы слева.")
 
     with st.spinner("Генерирую ответ..."):
         agent = get_agent()
         if results:
-            context = "\n\n".join(f"[Источник: {d.name}]\n{d.content}" for d in results)
-            prompt = (
-                "Ответь на вопрос, используя ТОЛЬКО текст из документов ниже. "
-                "Если ответа нет в тексте - честно скажи об этом. "
-                "Отвечай на русском языке. В конце укажи, из какого файла взята информация.\n\n"
-                "ТЕКСТ ДОКУМЕНТОВ:\n" + context + "\n\nВОПРОС: " + question
-            )
+            ctx = "\n\n".join(f"[Источник: {d.name}{page_of(d)}]\n{d.content}" for d in results)
+            prompt = ("Ответь, используя ТОЛЬКО текст из документов ниже. "
+                      "Если ответа нет - честно скажи. Отвечай на русском. "
+                      "В конце укажи файл и номера страниц, откуда взята информация.\n\n"
+                      "ТЕКСТ:\n" + ctx + "\n\nВОПРОС: " + question)
             response = agent.run(prompt)
         else:
             response = agent.run(question)
 
     st.header("Ответ")
     st.markdown(response.content)
+    st.session_state.history.insert(0, (question, response.content))
 
-with st.expander("Как это работает"):
-    st.markdown(
-        "1. Файлы разбиваются на чанки по 800 символов (перекрытие 150).\n"
-        "2. OpenAI Embeddings создаёт векторы.\n"
-        "3. LanceDB ищет похожие фрагменты.\n"
-        "4. Gemini отвечает только по найденным фрагментам."
-    )
+# ---------- История вопросов ----------
+if st.session_state.history:
+    st.divider()
+    st.subheader("История вопросов")
+    for q, a in st.session_state.history:
+        with st.expander(q):
+            st.markdown(a)
