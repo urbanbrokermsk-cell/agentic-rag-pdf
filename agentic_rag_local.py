@@ -25,7 +25,7 @@ from agno.document.chunking.fixed import FixedSizeChunking
 
 load_dotenv()
 
-APP_NAME = "🔍 Поиск"   # <-- сюда впиши своё название
+APP_NAME = "🔥 Agentic RAG - чат с документами"   # <-- сюда впиши своё название
 
 DB_DIR = "data/lancedb"
 TABLE_NAME = "documents"
