@@ -1,9 +1,10 @@
 """
 Agentic RAG - облачная версия (aitunnel)
-Эмбеддинги: text-embedding-3-small | Генерация: Gemini | Цитаты со страницами
+Фичи: цитаты со страницами, история, удаление документов (через payload)
 """
 
 import os
+import json
 import hashlib
 import tempfile
 from pathlib import Path
@@ -24,7 +25,6 @@ from agno.document.chunking.fixed import FixedSizeChunking
 
 load_dotenv()
 
-# ========================= НАСТРОЙКИ =========================
 DB_DIR = "data/lancedb"
 TABLE_NAME = "documents"
 LLM_MODEL = "gemini-3.1-flash-lite"
@@ -34,11 +34,9 @@ API_KEY = os.getenv("AITUNNEL_API_KEY")
 BASE_URL = "https://api.aitunnel.ru/v1"
 NUM_DOCUMENTS = 10
 SEARCH_TYPE = SearchType.vector
-
 CHUNKER = FixedSizeChunking(chunk_size=800, overlap=150)
 
 
-# ================== КЭШИРОВАННЫЕ РЕСУРСЫ ==================
 @st.cache_resource
 def get_embedder():
     return OpenAIEmbedder(id=EMBED_MODEL, dimensions=EMBED_DIM,
@@ -47,9 +45,9 @@ def get_embedder():
 
 @st.cache_resource
 def get_knowledge_base() -> AgentKnowledge:
-    vector_db = LanceDb(table_name=TABLE_NAME, uri=DB_DIR, use_tantivy=False,
-                        search_type=SEARCH_TYPE, embedder=get_embedder())
-    return AgentKnowledge(vector_db=vector_db, num_documents=NUM_DOCUMENTS)
+    vdb = LanceDb(table_name=TABLE_NAME, uri=DB_DIR, use_tantivy=False,
+                  search_type=SEARCH_TYPE, embedder=get_embedder())
+    return AgentKnowledge(vector_db=vdb, num_documents=NUM_DOCUMENTS)
 
 
 @st.cache_resource
@@ -77,7 +75,59 @@ def page_of(doc) -> str:
     return f", стр. {p}" if p else ""
 
 
-# ================== ОБРАБОТКА ДОКУМЕНТОВ ==================
+def _parse_payload(p):
+    if isinstance(p, str):
+        try:
+            return json.loads(p)
+        except Exception:
+            return {}
+    return p or {}
+
+
+def _open_table():
+    return get_knowledge_base().vector_db.table
+
+
+def list_documents() -> list:
+    """Уникальные имена документов из payload."""
+    try:
+        rows = _open_table().search().limit(100000).to_list()
+        names = set()
+        for r in rows:
+            d = _parse_payload(r.get("payload"))
+            n = d.get("name")
+            if n:
+                names.add(n)
+        return sorted(names)
+    except Exception:
+        return []
+
+
+def delete_document(name: str) -> bool:
+    """Удаляет документ: читает все строки, выкидывает нужный, пересоздаёт таблицу."""
+    try:
+        tbl = _open_table()
+        rows = tbl.search().limit(100000).to_list()
+        keep = []
+        for r in rows:
+            d = _parse_payload(r.get("payload"))
+            if d.get("name") != name:
+                keep.append({"vector": r["vector"], "id": r["id"],
+                             "payload": r["payload"]})
+        db = get_knowledge_base().vector_db
+        try:
+            db.connection.drop_table(TABLE_NAME)
+        except Exception:
+            pass
+        if keep:
+            db.connection.create_table(TABLE_NAME, data=keep)
+        st.cache_resource.clear()
+        return True
+    except Exception as e:
+        st.sidebar.error(f"Ошибка удаления: {e}")
+        return False
+
+
 def html_to_text(raw_html: str) -> str:
     soup = BeautifulSoup(raw_html, "html.parser")
     for tag in soup(["script", "style", "noscript", "header", "footer", "nav"]):
@@ -87,9 +137,8 @@ def html_to_text(raw_html: str) -> str:
 
 def chunk_text(name: str, text: str, page=None) -> list:
     doc = Document(name=name, content=text)
-    chunks = CHUNKER.chunk(doc)
     good = []
-    for c in chunks:
+    for c in CHUNKER.chunk(doc):
         if c.content and len(c.content.strip()) > 30:
             c.name = name
             c.meta_data = {"source": name, "page": page}
@@ -100,41 +149,40 @@ def chunk_text(name: str, text: str, page=None) -> list:
 def read_pdf_bytes(name: str, data: bytes) -> list:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f:
         f.write(data)
-        tmp_path = f.name
+        tmp = f.name
     chunks = []
     try:
-        reader = PyPdfReader(tmp_path)
-        for page_num, page in enumerate(reader.pages, 1):
-            text = page.extract_text() or ""
-            if text.strip():
-                chunks.extend(chunk_text(name, text, page=page_num))
+        for i, page in enumerate(PyPdfReader(tmp).pages, 1):
+            txt = page.extract_text() or ""
+            if txt.strip():
+                chunks.extend(chunk_text(name, txt, page=i))
     finally:
-        Path(tmp_path).unlink(missing_ok=True)
+        Path(tmp).unlink(missing_ok=True)
     return chunks
 
 
 def process_file(filename: str, data: bytes) -> list:
-    suffix = Path(filename).suffix.lower()
-    if suffix == ".pdf":
+    s = Path(filename).suffix.lower()
+    if s == ".pdf":
         return read_pdf_bytes(filename, data)
-    if suffix in (".html", ".htm"):
+    if s in (".html", ".htm"):
         return chunk_text(filename, html_to_text(data.decode("utf-8", errors="ignore")))
-    if suffix in (".txt", ".md"):
+    if s in (".txt", ".md"):
         return chunk_text(filename, data.decode("utf-8", errors="ignore"))
     return []
 
 
-def ingest(docs: list, source_name: str) -> bool:
+def ingest(docs: list, name: str) -> bool:
     if not docs:
-        st.sidebar.warning(f"Не извлечён текст: {source_name}")
+        st.sidebar.warning(f"Не извлечён текст: {name}")
         return False
     try:
         get_knowledge_base().load_documents(documents=docs, skip_existing=True)
-        st.session_state.sources.append(f"{source_name} ({len(docs)} чанков)")
-        st.sidebar.success(f"{source_name}: {len(docs)} чанков")
+        st.session_state.sources.append(f"{name} ({len(docs)} чанков)")
+        st.sidebar.success(f"{name}: {len(docs)} чанков")
         return True
     except Exception as e:
-        st.sidebar.error(f"Ошибка {source_name}: {e}")
+        st.sidebar.error(f"Ошибка {name}: {e}")
         return False
 
 
@@ -145,12 +193,9 @@ def file_fingerprint(name: str, data: bytes) -> str:
 # ================== ИНТЕРФЕЙС ==================
 st.set_page_config(page_title="Agentic RAG", page_icon="🔥")
 
-if "loaded_files" not in st.session_state:
-    st.session_state.loaded_files = set()
-if "sources" not in st.session_state:
-    st.session_state.sources = []
-if "history" not in st.session_state:
-    st.session_state.history = []
+for k, v in [("loaded_files", set()), ("sources", []), ("history", [])]:
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 st.title("🔥 Agentic RAG - чат с документами")
 
@@ -161,7 +206,6 @@ if dim == 0:
     st.stop()
 st.caption(f"Эмбеддер работает (облако), размерность вектора: {dim}")
 
-# ---------- Боковая панель ----------
 st.sidebar.header("Источники знаний")
 url = st.sidebar.text_input("Добавить URL", placeholder="https://...")
 if st.sidebar.button("Добавить URL") and url and url not in st.session_state.loaded_files:
@@ -190,15 +234,23 @@ if uploaded:
             if ingest(process_file(f.name, data), f.name):
                 st.session_state.loaded_files.add(fid)
 
-st.sidebar.header("Текущие источники")
-for s in st.session_state.sources:
-    st.sidebar.markdown(f"- {s}")
-if not st.session_state.sources:
-    st.sidebar.caption("Пока пусто.")
+st.sidebar.divider()
+st.sidebar.header("Документы в базе")
+docs_in_db = list_documents()
+if docs_in_db:
+    sel = st.sidebar.selectbox("Документ для удаления", docs_in_db)
+    if st.sidebar.button("🗑 Удалить выбранный"):
+        if delete_document(sel):
+            st.session_state.sources = [s for s in st.session_state.sources
+                                        if not s.startswith(sel)]
+            st.sidebar.success(f"Удалён: {sel}")
+            st.rerun()
+else:
+    st.sidebar.caption("База пуста.")
 
-if st.sidebar.button("Очистить базу знаний"):
+if st.sidebar.button("Очистить базу полностью"):
     try:
-        get_knowledge_base().vector_db.drop()
+        get_knowledge_base().vector_db.connection.drop_table(TABLE_NAME)
     except Exception:
         pass
     st.session_state.loaded_files = set()
@@ -207,7 +259,6 @@ if st.sidebar.button("Очистить базу знаний"):
     st.cache_resource.clear()
     st.rerun()
 
-# ---------- Вопрос и ответ ----------
 question = st.text_input("Ваш вопрос:", placeholder="О чём документ?")
 if st.button("Получить ответ") and question:
     kb = get_knowledge_base()
@@ -231,7 +282,7 @@ if st.button("Получить ответ") and question:
             ctx = "\n\n".join(f"[Источник: {d.name}{page_of(d)}]\n{d.content}" for d in results)
             prompt = ("Ответь, используя ТОЛЬКО текст из документов ниже. "
                       "Если ответа нет - честно скажи. Отвечай на русском. "
-                      "В конце укажи файл и номера страниц, откуда взята информация.\n\n"
+                      "В конце укажи файл и номера страниц.\n\n"
                       "ТЕКСТ:\n" + ctx + "\n\nВОПРОС: " + question)
             response = agent.run(prompt)
         else:
@@ -241,7 +292,6 @@ if st.button("Получить ответ") and question:
     st.markdown(response.content)
     st.session_state.history.insert(0, (question, response.content))
 
-# ---------- История вопросов ----------
 if st.session_state.history:
     st.divider()
     st.subheader("История вопросов")
