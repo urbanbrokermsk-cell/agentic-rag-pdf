@@ -1,6 +1,6 @@
 """
-Agentic RAG - облако (aitunnel) + веб-поиск (Tavily)
-Режимы: Документы / Веб
+Поисковая система - облако (aitunnel) + веб-поиск (Tavily)
+Режимы: Документы / Веб | Тёмная тема, карточки источников
 """
 
 import os
@@ -25,6 +25,8 @@ from agno.document.chunking.fixed import FixedSizeChunking
 
 load_dotenv()
 
+APP_NAME = "🔍 Поиск"   # <-- сюда впиши своё название
+
 DB_DIR = "data/lancedb"
 TABLE_NAME = "documents"
 LLM_MODEL = "gemini-3.1-flash-lite"
@@ -36,6 +38,26 @@ BASE_URL = "https://api.aitunnel.ru/v1"
 NUM_DOCUMENTS = 10
 SEARCH_TYPE = SearchType.vector
 CHUNKER = FixedSizeChunking(chunk_size=800, overlap=150)
+
+CARD_CSS = """
+<style>
+.src-card {
+    background: #1a1d24;
+    border: 1px solid #2a2f3a;
+    border-left: 3px solid #00d97e;
+    border-radius: 8px;
+    padding: 12px 14px;
+    margin-bottom: 10px;
+}
+.src-card a { color: #00d97e; text-decoration: none; font-weight: 600; }
+.src-card a:hover { text-decoration: underline; }
+.src-title { font-weight: 600; color: #e6e6e6; margin-bottom: 4px; }
+.src-snippet { color: #9aa0aa; font-size: 0.85rem; line-height: 1.4; }
+code { color: #00d97e !important; background: #11151c !important;
+       padding: 2px 6px; border-radius: 4px; }
+.stMarkdown pre code { color: #00d97e !important; }
+</style>
+"""
 
 
 @st.cache_resource
@@ -62,7 +84,6 @@ def get_agent() -> Agent:
 
 
 def web_search(query: str, max_results: int = 6) -> list:
-    """Поиск в интернете через Tavily (ключ в заголовке Authorization)."""
     if not TAVILY_KEY:
         return []
     try:
@@ -204,21 +225,21 @@ def file_fingerprint(name: str, data: bytes) -> str:
 
 
 # ================== ИНТЕРФЕЙС ==================
-st.set_page_config(page_title="Agentic RAG", page_icon="🔥")
+st.set_page_config(page_title=APP_NAME, page_icon="🔍", layout="wide")
+st.markdown(CARD_CSS, unsafe_allow_html=True)
 
 for k, v in [("loaded_files", set()), ("sources", []), ("history", [])]:
     if k not in st.session_state:
         st.session_state[k] = v
 
-st.title("🔥 Agentic RAG - чат с документами и вебом")
+st.title(APP_NAME)
 
 dim = check_embedder()
 if dim == 0:
     st.error("Эмбеддер не работает. Проверьте ключ в .env.\n\n"
              f"Детали: {st.session_state.get('embed_error', 'нет данных')}")
     st.stop()
-st.caption(f"Эмбеддер работает (облако), размерность: {dim} | "
-           f"Веб-поиск: {'включён' if TAVILY_KEY else 'нет ключа Tavily'}")
+st.caption(f"Готов к работе | Веб-поиск: {'включён' if TAVILY_KEY else 'нет ключа'}")
 
 st.sidebar.header("Источники знаний")
 url = st.sidebar.text_input("Добавить URL", placeholder="https://...")
@@ -273,32 +294,36 @@ if st.sidebar.button("Очистить базу полностью"):
     st.cache_resource.clear()
     st.rerun()
 
-# ---------- Режим и вопрос ----------
 mode = st.radio("Где искать:", ["📄 Документы", "🌐 Веб"], horizontal=True)
 question = st.text_input("Ваш вопрос:", placeholder="Задайте вопрос")
 
 if st.button("Получить ответ") and question:
     agent = get_agent()
+    response = None
 
     if mode == "🌐 Веб":
         with st.spinner("Ищу в интернете..."):
             results = web_search(question)
         if results:
-            with st.expander(f"Найдено источников: {len(results)}"):
-                for i, r in enumerate(results, 1):
-                    st.markdown(f"**{i}. [{r.get('title','без названия')}]({r.get('url','')})**")
-                    st.caption((r.get("content") or "")[:300] + "...")
+            st.subheader("Источники")
+            for i, r in enumerate(results, 1):
+                title = r.get("title", "без названия")
+                link = r.get("url", "")
+                snip = (r.get("content") or "")[:250]
+                st.markdown(
+                    f'<div class="src-card"><div class="src-title">{i}. '
+                    f'<a href="{link}" target="_blank">{title}</a></div>'
+                    f'<div class="src-snippet">{snip}...</div></div>',
+                    unsafe_allow_html=True)
             ctx = "\n\n".join(f"[Источник: {r.get('title')} ({r.get('url')})]\n{r.get('content','')}"
                               for r in results)
             prompt = ("Ответь на вопрос, используя текст из веб-источников ниже. "
-                      "Отвечай на русском. В конце приведи список использованных "
-                      "источников со ссылками.\n\nИСТОЧНИКИ:\n" + ctx +
-                      "\n\nВОПРОС: " + question)
+                      "Отвечай на русском. В конце приведи список источников со "
+                      "ссылками.\n\nИСТОЧНИКИ:\n" + ctx + "\n\nВОПРОС: " + question)
             with st.spinner("Генерирую ответ..."):
                 response = agent.run(prompt)
         else:
-            st.warning("Веб-поиск ничего не вернул (проверьте ключ Tavily).")
-            response = None
+            st.warning("Веб-поиск ничего не вернул.")
     else:
         kb = get_knowledge_base()
         with st.spinner("Ищу в документах..."):
@@ -307,17 +332,22 @@ if st.button("Получить ответ") and question:
             except Exception:
                 results = []
         if results:
-            with st.expander(f"Найдено фрагментов: {len(results)} (источники)"):
-                for i, doc in enumerate(results, 1):
-                    st.markdown(f"**{i}. {doc.name}{page_of(doc)}**")
-                    st.caption(doc.content[:400] + "...")
+            st.subheader("Источники")
+            for i, doc in enumerate(results, 1):
+                snip = doc.content[:250]
+                st.markdown(
+                    f'<div class="src-card"><div class="src-title">{i}. '
+                    f'{doc.name}{page_of(doc)}</div>'
+                    f'<div class="src-snippet">{snip}...</div></div>',
+                    unsafe_allow_html=True)
+            ctx = "\n\n".join(f"[Источник: {d.name}{page_of(d)}]\n{d.content}" for d in results)
+            prompt = ("Ответь, используя ТОЛЬКО текст из документов ниже. "
+                      "Если ответа нет - честно скажи. Отвечай на русском. "
+                      "В конце укажи файл и номера страниц.\n\n"
+                      "ТЕКСТ:\n" + ctx + "\n\nВОПРОС: " + question)
         else:
             st.warning("Ничего не найдено. Загрузите документы слева.")
-        ctx = "\n\n".join(f"[Источник: {d.name}{page_of(d)}]\n{d.content}" for d in results)
-        prompt = ("Ответь, используя ТОЛЬКО текст из документов ниже. "
-                  "Если ответа нет - честно скажи. Отвечай на русском. "
-                  "В конце укажи файл и номера страниц.\n\n"
-                  "ТЕКСТ:\n" + ctx + "\n\nВОПРОС: " + question) if results else question
+            prompt = question
         with st.spinner("Генерирую ответ..."):
             response = agent.run(prompt)
 
