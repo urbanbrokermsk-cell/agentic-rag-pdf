@@ -1,6 +1,6 @@
 """
-Agentic RAG - облачная версия (aitunnel)
-Фичи: цитаты со страницами, история, удаление документов (через payload)
+Agentic RAG - облако (aitunnel) + веб-поиск (Tavily)
+Режимы: Документы / Веб
 """
 
 import os
@@ -31,6 +31,7 @@ LLM_MODEL = "gemini-3.1-flash-lite"
 EMBED_MODEL = "text-embedding-3-small"
 EMBED_DIM = 1536
 API_KEY = os.getenv("AITUNNEL_API_KEY")
+TAVILY_KEY = os.getenv("TAVILY_API_KEY")
 BASE_URL = "https://api.aitunnel.ru/v1"
 NUM_DOCUMENTS = 10
 SEARCH_TYPE = SearchType.vector
@@ -58,6 +59,25 @@ def get_agent() -> Agent:
                       "Если ответа нет - честно скажи.", "Отвечай на русском."],
         markdown=True,
     )
+
+
+def web_search(query: str, max_results: int = 6) -> list:
+    """Поиск в интернете через Tavily (ключ в заголовке Authorization)."""
+    if not TAVILY_KEY:
+        return []
+    try:
+        r = requests.post(
+            "https://api.tavily.com/search",
+            headers={"Authorization": f"Bearer {TAVILY_KEY}"},
+            json={"query": query, "search_depth": "advanced",
+                  "max_results": max_results},
+            timeout=40,
+        )
+        r.raise_for_status()
+        return r.json().get("results", [])
+    except Exception as e:
+        st.error(f"Ошибка веб-поиска: {e}")
+        return []
 
 
 def check_embedder() -> int:
@@ -89,13 +109,11 @@ def _open_table():
 
 
 def list_documents() -> list:
-    """Уникальные имена документов из payload."""
     try:
         rows = _open_table().search().limit(100000).to_list()
         names = set()
         for r in rows:
-            d = _parse_payload(r.get("payload"))
-            n = d.get("name")
+            n = _parse_payload(r.get("payload")).get("name")
             if n:
                 names.add(n)
         return sorted(names)
@@ -104,16 +122,11 @@ def list_documents() -> list:
 
 
 def delete_document(name: str) -> bool:
-    """Удаляет документ: читает все строки, выкидывает нужный, пересоздаёт таблицу."""
     try:
         tbl = _open_table()
         rows = tbl.search().limit(100000).to_list()
-        keep = []
-        for r in rows:
-            d = _parse_payload(r.get("payload"))
-            if d.get("name") != name:
-                keep.append({"vector": r["vector"], "id": r["id"],
-                             "payload": r["payload"]})
+        keep = [{"vector": r["vector"], "id": r["id"], "payload": r["payload"]}
+                for r in rows if _parse_payload(r.get("payload")).get("name") != name]
         db = get_knowledge_base().vector_db
         try:
             db.connection.drop_table(TABLE_NAME)
@@ -197,14 +210,15 @@ for k, v in [("loaded_files", set()), ("sources", []), ("history", [])]:
     if k not in st.session_state:
         st.session_state[k] = v
 
-st.title("🔥 Agentic RAG - чат с документами")
+st.title("🔥 Agentic RAG - чат с документами и вебом")
 
 dim = check_embedder()
 if dim == 0:
     st.error("Эмбеддер не работает. Проверьте ключ в .env.\n\n"
              f"Детали: {st.session_state.get('embed_error', 'нет данных')}")
     st.stop()
-st.caption(f"Эмбеддер работает (облако), размерность вектора: {dim}")
+st.caption(f"Эмбеддер работает (облако), размерность: {dim} | "
+           f"Веб-поиск: {'включён' if TAVILY_KEY else 'нет ключа Tavily'}")
 
 st.sidebar.header("Источники знаний")
 url = st.sidebar.text_input("Добавить URL", placeholder="https://...")
@@ -259,38 +273,58 @@ if st.sidebar.button("Очистить базу полностью"):
     st.cache_resource.clear()
     st.rerun()
 
-question = st.text_input("Ваш вопрос:", placeholder="О чём документ?")
+# ---------- Режим и вопрос ----------
+mode = st.radio("Где искать:", ["📄 Документы", "🌐 Веб"], horizontal=True)
+question = st.text_input("Ваш вопрос:", placeholder="Задайте вопрос")
+
 if st.button("Получить ответ") and question:
-    kb = get_knowledge_base()
-    with st.spinner("Ищу..."):
-        try:
-            results = kb.search(query=question)
-        except Exception:
-            results = []
+    agent = get_agent()
 
-    if results:
-        with st.expander(f"Найдено фрагментов: {len(results)} (источники)"):
-            for i, doc in enumerate(results, 1):
-                st.markdown(f"**{i}. {doc.name}{page_of(doc)}**")
-                st.caption(doc.content[:400] + "...")
-    else:
-        st.warning("Ничего не найдено. Загрузите документы слева.")
-
-    with st.spinner("Генерирую ответ..."):
-        agent = get_agent()
+    if mode == "🌐 Веб":
+        with st.spinner("Ищу в интернете..."):
+            results = web_search(question)
         if results:
-            ctx = "\n\n".join(f"[Источник: {d.name}{page_of(d)}]\n{d.content}" for d in results)
-            prompt = ("Ответь, используя ТОЛЬКО текст из документов ниже. "
-                      "Если ответа нет - честно скажи. Отвечай на русском. "
-                      "В конце укажи файл и номера страниц.\n\n"
-                      "ТЕКСТ:\n" + ctx + "\n\nВОПРОС: " + question)
-            response = agent.run(prompt)
+            with st.expander(f"Найдено источников: {len(results)}"):
+                for i, r in enumerate(results, 1):
+                    st.markdown(f"**{i}. [{r.get('title','без названия')}]({r.get('url','')})**")
+                    st.caption((r.get("content") or "")[:300] + "...")
+            ctx = "\n\n".join(f"[Источник: {r.get('title')} ({r.get('url')})]\n{r.get('content','')}"
+                              for r in results)
+            prompt = ("Ответь на вопрос, используя текст из веб-источников ниже. "
+                      "Отвечай на русском. В конце приведи список использованных "
+                      "источников со ссылками.\n\nИСТОЧНИКИ:\n" + ctx +
+                      "\n\nВОПРОС: " + question)
+            with st.spinner("Генерирую ответ..."):
+                response = agent.run(prompt)
         else:
-            response = agent.run(question)
+            st.warning("Веб-поиск ничего не вернул (проверьте ключ Tavily).")
+            response = None
+    else:
+        kb = get_knowledge_base()
+        with st.spinner("Ищу в документах..."):
+            try:
+                results = kb.search(query=question)
+            except Exception:
+                results = []
+        if results:
+            with st.expander(f"Найдено фрагментов: {len(results)} (источники)"):
+                for i, doc in enumerate(results, 1):
+                    st.markdown(f"**{i}. {doc.name}{page_of(doc)}**")
+                    st.caption(doc.content[:400] + "...")
+        else:
+            st.warning("Ничего не найдено. Загрузите документы слева.")
+        ctx = "\n\n".join(f"[Источник: {d.name}{page_of(d)}]\n{d.content}" for d in results)
+        prompt = ("Ответь, используя ТОЛЬКО текст из документов ниже. "
+                  "Если ответа нет - честно скажи. Отвечай на русском. "
+                  "В конце укажи файл и номера страниц.\n\n"
+                  "ТЕКСТ:\n" + ctx + "\n\nВОПРОС: " + question) if results else question
+        with st.spinner("Генерирую ответ..."):
+            response = agent.run(prompt)
 
-    st.header("Ответ")
-    st.markdown(response.content)
-    st.session_state.history.insert(0, (question, response.content))
+    if response:
+        st.header("Ответ")
+        st.markdown(response.content)
+        st.session_state.history.insert(0, (f"[{mode}] {question}", response.content))
 
 if st.session_state.history:
     st.divider()
