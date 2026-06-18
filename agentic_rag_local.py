@@ -1,6 +1,5 @@
 """
-Поисковая система - облако (aitunnel) + веб-поиск (Tavily)
-Режимы: Документы / Веб | Тёмная тема, карточки источников
+Agentic RAG - чат с памятью + веб-поиск + статусы + связанные вопросы
 """
 
 import os
@@ -25,7 +24,8 @@ from agno.document.chunking.fixed import FixedSizeChunking
 
 load_dotenv()
 
-APP_NAME = "🔥 Agentic RAG - чат с документами"   # <-- сюда впиши своё название
+APP_NAME = "🔥 Agentic RAG - чат с документами"
+MEMORY_PAIRS = 5
 
 DB_DIR = "data/lancedb"
 TABLE_NAME = "documents"
@@ -41,21 +41,14 @@ CHUNKER = FixedSizeChunking(chunk_size=800, overlap=150)
 
 CARD_CSS = """
 <style>
-.src-card {
-    background: #1a1d24;
-    border: 1px solid #2a2f3a;
-    border-left: 3px solid #00d97e;
-    border-radius: 8px;
-    padding: 12px 14px;
-    margin-bottom: 10px;
-}
-.src-card a { color: #00d97e; text-decoration: none; font-weight: 600; }
-.src-card a:hover { text-decoration: underline; }
-.src-title { font-weight: 600; color: #e6e6e6; margin-bottom: 4px; }
-.src-snippet { color: #9aa0aa; font-size: 0.85rem; line-height: 1.4; }
-code { color: #00d97e !important; background: #11151c !important;
-       padding: 2px 6px; border-radius: 4px; }
-.stMarkdown pre code { color: #00d97e !important; }
+.src-card { background:#1a1d24; border:1px solid #2a2f3a;
+    border-left:3px solid #00d97e; border-radius:8px;
+    padding:10px 12px; margin-bottom:8px; }
+.src-card a { color:#00d97e; text-decoration:none; font-weight:600; }
+.src-title { font-weight:600; color:#e6e6e6; margin-bottom:4px; }
+.src-snippet { color:#9aa0aa; font-size:0.85rem; line-height:1.4; }
+code { color:#00d97e !important; background:#11151c !important;
+    padding:2px 6px; border-radius:4px; }
 </style>
 """
 
@@ -77,8 +70,7 @@ def get_knowledge_base() -> AgentKnowledge:
 def get_agent() -> Agent:
     return Agent(
         model=OpenAIChat(id=LLM_MODEL, api_key=API_KEY, base_url=BASE_URL),
-        instructions=["Отвечай ТОЛЬКО по переданному контексту.",
-                      "Если ответа нет - честно скажи.", "Отвечай на русском."],
+        instructions=["Отвечай на русском.", "Будь точным и опирайся на контекст."],
         markdown=True,
     )
 
@@ -87,13 +79,10 @@ def web_search(query: str, max_results: int = 6) -> list:
     if not TAVILY_KEY:
         return []
     try:
-        r = requests.post(
-            "https://api.tavily.com/search",
+        r = requests.post("https://api.tavily.com/search",
             headers={"Authorization": f"Bearer {TAVILY_KEY}"},
             json={"query": query, "search_depth": "advanced",
-                  "max_results": max_results},
-            timeout=40,
-        )
+                  "max_results": max_results}, timeout=40)
         r.raise_for_status()
         return r.json().get("results", [])
     except Exception as e:
@@ -212,7 +201,6 @@ def ingest(docs: list, name: str) -> bool:
         return False
     try:
         get_knowledge_base().load_documents(documents=docs, skip_existing=True)
-        st.session_state.sources.append(f"{name} ({len(docs)} чанков)")
         st.sidebar.success(f"{name}: {len(docs)} чанков")
         return True
     except Exception as e:
@@ -224,13 +212,108 @@ def file_fingerprint(name: str, data: bytes) -> str:
     return hashlib.sha256(name.encode() + data).hexdigest()
 
 
+def memory_context() -> str:
+    msgs = st.session_state.messages
+    pairs, i, count = [], len(msgs) - 1, 0
+    while i >= 1 and count < MEMORY_PAIRS:
+        if msgs[i]["role"] == "assistant" and msgs[i - 1]["role"] == "user":
+            pairs.insert(0, f"Вопрос: {msgs[i-1]['content']}\nОтвет: {msgs[i]['content']}")
+            count += 1
+            i -= 2
+        else:
+            i -= 1
+    return "\n\n".join(pairs)
+
+
+def suggest_questions(question: str, answer: str) -> list:
+    """Генерирует 3 связанных вопроса."""
+    try:
+        agent = get_agent()
+        p = (f"На основе вопроса и ответа предложи 3 коротких уточняющих вопроса "
+             f"для продолжения беседы. Только вопросы, каждый с новой строки, без "
+             f"нумерации.\n\nВОПРОС: {question}\n\nОТВЕТ: {answer[:1500]}")
+        r = agent.run(p)
+        lines = [l.strip(" -•0123456789.").strip()
+                 for l in r.content.split("\n") if l.strip()]
+        return [l for l in lines if len(l) > 5][:3]
+    except Exception:
+        return []
+
+
+def answer_question(question: str):
+    """Обрабатывает вопрос: поиск, статусы, ответ, связанные вопросы."""
+    agent = get_agent()
+    mem = memory_context()
+    mode = st.session_state.get("mode", "📄 Документы")
+
+    with st.status("Обрабатываю запрос...", expanded=True) as status:
+        if mode == "🌐 Веб":
+            st.write("🔎 Ищу источники в интернете...")
+            results = web_search(question)
+            st.write(f"📄 Найдено источников: {len(results)}")
+            if results:
+                cards = ""
+                for i, r in enumerate(results, 1):
+                    cards += (f'<div class="src-card"><div class="src-title">{i}. '
+                              f'<a href="{r.get("url","")}" target="_blank">'
+                              f'{r.get("title","без названия")}</a></div>'
+                              f'<div class="src-snippet">{(r.get("content") or "")[:200]}'
+                              f'...</div></div>')
+                st.markdown(cards, unsafe_allow_html=True)
+                ctx = "\n\n".join(f"[{r.get('title')} ({r.get('url')})]\n{r.get('content','')}"
+                                  for r in results)
+                prompt = (f"Контекст беседы:\n{mem}\n\n" if mem else "") + \
+                    ("Ответь на новый вопрос, используя веб-источники ниже и учитывая "
+                     "беседу. На русском. В конце список источников со ссылками.\n\n"
+                     f"ИСТОЧНИКИ:\n{ctx}\n\nВОПРОС: {question}")
+            else:
+                prompt = (f"Контекст:\n{mem}\n\n" if mem else "") + question
+        else:
+            st.write("🔎 Ищу в документах...")
+            try:
+                results = get_knowledge_base().search(query=question)
+            except Exception:
+                results = []
+            st.write(f"📄 Найдено фрагментов: {len(results)}")
+            if results:
+                cards = ""
+                for i, d in enumerate(results, 1):
+                    cards += (f'<div class="src-card"><div class="src-title">{i}. '
+                              f'{d.name}{page_of(d)}</div>'
+                              f'<div class="src-snippet">{d.content[:200]}...</div></div>')
+                st.markdown(cards, unsafe_allow_html=True)
+                ctx = "\n\n".join(f"[{d.name}{page_of(d)}]\n{d.content}" for d in results)
+                prompt = (f"Контекст беседы:\n{mem}\n\n" if mem else "") + \
+                    ("Ответь на новый вопрос, используя ТОЛЬКО документы ниже и учитывая "
+                     "беседу. Если ответа нет - скажи. На русском. В конце укажи файл "
+                     f"и страницы.\n\nТЕКСТ:\n{ctx}\n\nВОПРОС: {question}")
+            else:
+                prompt = (f"Контекст:\n{mem}\n\n" if mem else "") + question
+
+        st.write("✍️ Формирую ответ...")
+        response = agent.run(prompt)
+        status.update(label="Готово", state="complete", expanded=False)
+
+    st.markdown(response.content)
+    st.session_state.messages.append({"role": "assistant", "content": response.content})
+
+    sugg = suggest_questions(question, response.content)
+    if sugg:
+        st.session_state.suggestions = sugg
+
+
 # ================== ИНТЕРФЕЙС ==================
-st.set_page_config(page_title=APP_NAME, page_icon="🔍", layout="wide")
+st.set_page_config(page_title=APP_NAME, page_icon="🔥", layout="wide")
 st.markdown(CARD_CSS, unsafe_allow_html=True)
 
-for k, v in [("loaded_files", set()), ("sources", []), ("history", [])]:
-    if k not in st.session_state:
-        st.session_state[k] = v
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "loaded_files" not in st.session_state:
+    st.session_state.loaded_files = set()
+if "suggestions" not in st.session_state:
+    st.session_state.suggestions = []
+if "pending" not in st.session_state:
+    st.session_state.pending = None
 
 st.title(APP_NAME)
 
@@ -239,7 +322,8 @@ if dim == 0:
     st.error("Эмбеддер не работает. Проверьте ключ в .env.\n\n"
              f"Детали: {st.session_state.get('embed_error', 'нет данных')}")
     st.stop()
-st.caption(f"Готов к работе | Веб-поиск: {'включён' if TAVILY_KEY else 'нет ключа'}")
+st.caption(f"Готов | Веб: {'включён' if TAVILY_KEY else 'нет ключа'} | "
+           f"Память: {MEMORY_PAIRS} пар")
 
 st.sidebar.header("Источники знаний")
 url = st.sidebar.text_input("Добавить URL", placeholder="https://...")
@@ -276,8 +360,6 @@ if docs_in_db:
     sel = st.sidebar.selectbox("Документ для удаления", docs_in_db)
     if st.sidebar.button("🗑 Удалить выбранный"):
         if delete_document(sel):
-            st.session_state.sources = [s for s in st.session_state.sources
-                                        if not s.startswith(sel)]
             st.sidebar.success(f"Удалён: {sel}")
             st.rerun()
 else:
@@ -289,76 +371,48 @@ if st.sidebar.button("Очистить базу полностью"):
     except Exception:
         pass
     st.session_state.loaded_files = set()
-    st.session_state.sources = []
-    st.session_state.history = []
     st.cache_resource.clear()
     st.rerun()
 
-mode = st.radio("Где искать:", ["📄 Документы", "🌐 Веб"], horizontal=True)
-question = st.text_input("Ваш вопрос:", placeholder="Задайте вопрос")
+st.sidebar.divider()
+st.session_state.mode = st.sidebar.radio("Где искать:", ["📄 Документы", "🌐 Веб"])
+if st.sidebar.button("🧹 Очистить диалог"):
+    st.session_state.messages = []
+    st.session_state.suggestions = []
+    st.rerun()
 
-if st.button("Получить ответ") and question:
-    agent = get_agent()
-    response = None
+# Лента
+for m in st.session_state.messages:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
 
-    if mode == "🌐 Веб":
-        with st.spinner("Ищу в интернете..."):
-            results = web_search(question)
-        if results:
-            st.subheader("Источники")
-            for i, r in enumerate(results, 1):
-                title = r.get("title", "без названия")
-                link = r.get("url", "")
-                snip = (r.get("content") or "")[:250]
-                st.markdown(
-                    f'<div class="src-card"><div class="src-title">{i}. '
-                    f'<a href="{link}" target="_blank">{title}</a></div>'
-                    f'<div class="src-snippet">{snip}...</div></div>',
-                    unsafe_allow_html=True)
-            ctx = "\n\n".join(f"[Источник: {r.get('title')} ({r.get('url')})]\n{r.get('content','')}"
-                              for r in results)
-            prompt = ("Ответь на вопрос, используя текст из веб-источников ниже. "
-                      "Отвечай на русском. В конце приведи список источников со "
-                      "ссылками.\n\nИСТОЧНИКИ:\n" + ctx + "\n\nВОПРОС: " + question)
-            with st.spinner("Генерирую ответ..."):
-                response = agent.run(prompt)
-        else:
-            st.warning("Веб-поиск ничего не вернул.")
-    else:
-        kb = get_knowledge_base()
-        with st.spinner("Ищу в документах..."):
-            try:
-                results = kb.search(query=question)
-            except Exception:
-                results = []
-        if results:
-            st.subheader("Источники")
-            for i, doc in enumerate(results, 1):
-                snip = doc.content[:250]
-                st.markdown(
-                    f'<div class="src-card"><div class="src-title">{i}. '
-                    f'{doc.name}{page_of(doc)}</div>'
-                    f'<div class="src-snippet">{snip}...</div></div>',
-                    unsafe_allow_html=True)
-            ctx = "\n\n".join(f"[Источник: {d.name}{page_of(d)}]\n{d.content}" for d in results)
-            prompt = ("Ответь, используя ТОЛЬКО текст из документов ниже. "
-                      "Если ответа нет - честно скажи. Отвечай на русском. "
-                      "В конце укажи файл и номера страниц.\n\n"
-                      "ТЕКСТ:\n" + ctx + "\n\nВОПРОС: " + question)
-        else:
-            st.warning("Ничего не найдено. Загрузите документы слева.")
-            prompt = question
-        with st.spinner("Генерирую ответ..."):
-            response = agent.run(prompt)
+# Связанные вопросы (кнопки)
+if st.session_state.suggestions and st.session_state.messages:
+    st.caption("Связанные вопросы:")
+    cols = st.columns(len(st.session_state.suggestions))
+    for col, sq in zip(cols, st.session_state.suggestions):
+        if col.button(sq, key=f"sg_{sq}"):
+            st.session_state.pending = sq
+            st.session_state.suggestions = []
+            st.rerun()
 
-    if response:
-        st.header("Ответ")
-        st.markdown(response.content)
-        st.session_state.history.insert(0, (f"[{mode}] {question}", response.content))
+# Обработка отложенного вопроса (по кнопке)
+if st.session_state.pending:
+    q = st.session_state.pending
+    st.session_state.pending = None
+    st.session_state.messages.append({"role": "user", "content": q})
+    with st.chat_message("user"):
+        st.markdown(q)
+    with st.chat_message("assistant"):
+        answer_question(q)
+    st.rerun()
 
-if st.session_state.history:
-    st.divider()
-    st.subheader("История вопросов")
-    for q, a in st.session_state.history:
-        with st.expander(q):
-            st.markdown(a)
+# Ввод
+if question := st.chat_input("Задайте вопрос..."):
+    st.session_state.suggestions = []
+    st.session_state.messages.append({"role": "user", "content": question})
+    with st.chat_message("user"):
+        st.markdown(question)
+    with st.chat_message("assistant"):
+        answer_question(question)
+    st.rerun()
