@@ -1,5 +1,6 @@
 """
-Agentic RAG - Браузер AI: память + веб + оркестрация + реранкер (через LLM)
+Agentic RAG - Браузер AI: память + веб + оркестрация + реранкер
++ постоянные карточки источников (как Perplexity)
 """
 
 import os
@@ -7,6 +8,7 @@ import json
 import hashlib
 import tempfile
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 import streamlit as st
@@ -45,9 +47,16 @@ CARD_CSS = """
 .src-card { background:#1a1d24; border:1px solid #2a2f3a;
     border-left:3px solid #00d97e; border-radius:8px;
     padding:10px 12px; margin-bottom:8px; }
-.src-card a { color:#00d97e; text-decoration:none; font-weight:600; }
-.src-title { font-weight:600; color:#e6e6e6; margin-bottom:4px; }
-.src-snippet { color:#9aa0aa; font-size:0.85rem; line-height:1.4; }
+.src-card a { color:#00d97e; text-decoration:none; font-weight:600;
+    font-size:0.95rem; }
+.src-card a:hover { text-decoration:underline; }
+.src-title { font-weight:600; color:#00d97e; margin-bottom:2px;
+    font-size:0.95rem; }
+.src-meta { color:#6b7280; font-size:0.75rem; margin-bottom:5px; }
+.src-snippet { color:#9aa0aa; font-size:0.83rem; line-height:1.4;
+    display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical;
+    overflow:hidden; }
+.src-head { color:#9aa0aa; font-size:0.8rem; margin:6px 0 4px; }
 code { color:#00d97e !important; background:#11151c !important;
     padding:2px 6px; border-radius:4px; }
 </style>
@@ -104,6 +113,18 @@ def page_of(doc) -> str:
     md = getattr(doc, "meta_data", None) or {}
     p = md.get("page")
     return f", стр. {p}" if p else ""
+
+
+def page_num(doc):
+    md = getattr(doc, "meta_data", None) or {}
+    return md.get("page")
+
+
+def domain_of(url: str) -> str:
+    try:
+        return urlparse(url).netloc.replace("www.", "")
+    except Exception:
+        return ""
 
 
 def _parse_payload(p):
@@ -231,15 +252,14 @@ def memory_context() -> str:
 
 
 def rerank(question: str, items: list, get_text) -> list:
-    """Реранкер через LLM: оставляет RERANK_KEEP самых релевантных."""
     if len(items) <= RERANK_KEEP:
         return items
     try:
         agent = get_agent()
         listing = "\n".join(f"[{i}] {get_text(it)[:300]}" for i, it in enumerate(items))
         p = (f"Вопрос: {question}\n\nНиже фрагменты с номерами. Выбери до "
-             f"{RERANK_KEEP} САМЫХ релевантных вопросу. Ответь ТОЛЬКО номерами "
-             f"через запятую, по убыванию релевантности.\n\n{listing}")
+             f"{RERANK_KEEP} САМЫХ релевантных. Ответь ТОЛЬКО номерами через "
+             f"запятую по убыванию релевантности.\n\n{listing}")
         r = agent.run(p)
         nums = []
         for tok in r.content.replace(".", ",").split(","):
@@ -248,9 +268,7 @@ def rerank(question: str, items: list, get_text) -> list:
                 idx = int(tok)
                 if 0 <= idx < len(items) and idx not in nums:
                     nums.append(idx)
-        if nums:
-            return [items[i] for i in nums[:RERANK_KEEP]]
-        return items[:RERANK_KEEP]
+        return [items[i] for i in nums[:RERANK_KEEP]] if nums else items[:RERANK_KEEP]
     except Exception:
         return items[:RERANK_KEEP]
 
@@ -261,9 +279,9 @@ def classify_query(question: str) -> str:
     try:
         agent = get_agent()
         p = ("Определи, где искать ответ. Ответь ОДНИМ словом: "
-             "'документы' (вопрос про загруженные файлы/личные данные), "
-             "'веб' (нужна свежая/общая информация из интернета), "
-             f"'оба' (нужно и то и другое). ВОПРОС: {question}")
+             "'документы' (вопрос про загруженные файлы), "
+             "'веб' (свежая/общая информация из интернета), "
+             f"'оба'. ВОПРОС: {question}")
         ans = agent.run(p).content.lower()
         if "оба" in ans:
             return "оба"
@@ -281,24 +299,34 @@ def search_docs(question: str) -> list:
         return []
 
 
-def render_web_cards(results: list):
-    cards = ""
-    for i, r in enumerate(results, 1):
-        cards += (f'<div class="src-card"><div class="src-title">{i}. '
-                  f'<a href="{r.get("url","")}" target="_blank">'
-                  f'{r.get("title","без названия")}</a></div>'
-                  f'<div class="src-snippet">{(r.get("content") or "")[:200]}...'
-                  f'</div></div>')
-    st.markdown(cards, unsafe_allow_html=True)
+def build_sources(doc_results, web_results) -> list:
+    """Единый список источников для сохранения с сообщением."""
+    src = []
+    for d in doc_results:
+        src.append({"type": "doc", "title": d.name, "page": page_num(d),
+                    "url": "", "snippet": (d.content or "")[:200]})
+    for r in web_results:
+        src.append({"type": "web", "title": r.get("title", "без названия"),
+                    "page": None, "url": r.get("url", ""),
+                    "snippet": (r.get("content") or "")[:200]})
+    return src
 
 
-def render_doc_cards(results: list):
-    cards = ""
-    for i, d in enumerate(results, 1):
-        cards += (f'<div class="src-card"><div class="src-title">{i}. '
-                  f'{d.name}{page_of(d)}</div>'
-                  f'<div class="src-snippet">{d.content[:200]}...</div></div>')
-    st.markdown(cards, unsafe_allow_html=True)
+def render_sources(sources: list):
+    if not sources:
+        return
+    html = '<div class="src-head">Источники:</div>'
+    for i, s in enumerate(sources, 1):
+        if s["type"] == "web":
+            meta = domain_of(s["url"])
+            title = (f'<a href="{s["url"]}" target="_blank">{i}. {s["title"]}</a>')
+        else:
+            meta = s["title"] + (f' · стр. {s["page"]}' if s["page"] else "")
+            title = f'<div class="src-title">{i}. {s["title"]}</div>'
+        html += (f'<div class="src-card">{title}'
+                 f'<div class="src-meta">{meta}</div>'
+                 f'<div class="src-snippet">{s["snippet"]}...</div></div>')
+    st.markdown(html, unsafe_allow_html=True)
 
 
 def suggest_questions(question: str, answer: str) -> list:
@@ -336,35 +364,31 @@ def answer_question(question: str):
             st.write("🔎 Ищу в документах...")
             doc_results = search_docs(question)
             if doc_results:
-                st.write("⚖️ Переранжирую документы...")
+                st.write("⚖️ Переранжирую...")
                 doc_results = rerank(question, doc_results, lambda d: d.content)
-            st.write(f"📄 Фрагментов после реранкинга: {len(doc_results)}")
-            if doc_results:
-                render_doc_cards(doc_results)
+            st.write(f"📄 Фрагментов: {len(doc_results)}")
 
         if route in ("веб", "оба"):
             st.write("🔎 Ищу в интернете...")
             web_results = web_search(question)
             if web_results:
-                st.write("⚖️ Переранжирую веб-источники...")
+                st.write("⚖️ Переранжирую...")
                 web_results = rerank(question, web_results,
                                      lambda r: r.get("content", ""))
-            st.write(f"🌐 Источников после реранкинга: {len(web_results)}")
-            if web_results:
-                render_web_cards(web_results)
+            st.write(f"🌐 Источников: {len(web_results)}")
 
         parts = []
         for d in doc_results:
             parts.append(f"[Документ: {d.name}{page_of(d)}]\n{d.content}")
         for r in web_results:
-            parts.append(f"[Веб: {r.get('title')} ({r.get('url')})]\n{r.get('content','')}")
+            parts.append(f"[Веб: {r.get('title')}]\n{r.get('content','')}")
         ctx = "\n\n".join(parts)
 
         if ctx:
             prompt = (f"Контекст беседы:\n{mem}\n\n" if mem else "") + \
                 ("Ответь на новый вопрос, используя источники ниже и учитывая беседу. "
-                 "На русском. В конце укажи использованные источники.\n\n"
-                 f"ИСТОЧНИКИ:\n{ctx}\n\nВОПРОС: {question}")
+                 "На русском. НЕ перечисляй источники и ссылки в конце ответа - они "
+                 f"показываются отдельно.\n\nИСТОЧНИКИ:\n{ctx}\n\nВОПРОС: {question}")
         else:
             st.write("ℹ️ Источников нет, отвечаю напрямую.")
             prompt = (f"Контекст:\n{mem}\n\n" if mem else "") + question
@@ -373,9 +397,12 @@ def answer_question(question: str):
         response = agent.run(prompt)
         status.update(label="Готово", state="complete", expanded=False)
 
+    sources = build_sources(doc_results, web_results)
     st.markdown(response.content)
-    st.session_state.messages.append({"role": "assistant", "content": response.content})
-
+    render_sources(sources)
+    st.session_state.messages.append({"role": "assistant",
+                                       "content": response.content,
+                                       "sources": sources})
     sugg = suggest_questions(question, response.content)
     if sugg:
         st.session_state.suggestions = sugg
@@ -464,6 +491,8 @@ if st.sidebar.button("🧹 Очистить диалог"):
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
+        if m["role"] == "assistant" and m.get("sources"):
+            render_sources(m["sources"])
 
 if st.session_state.suggestions and st.session_state.messages:
     st.caption("Связанные вопросы:")
